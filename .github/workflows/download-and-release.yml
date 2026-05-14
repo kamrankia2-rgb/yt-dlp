@@ -1,0 +1,203 @@
+name: Download Video and Split for GitHub
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'Video URL to download'
+        required: true
+        type: string
+      output_repo:
+        description: 'Target repository (owner/repo)'
+        required: false
+        type: string
+        default: ''
+      chunk_size_mb:
+        description: 'Chunk size in MB (max 100)'
+        required: false
+        type: number
+        default: 95
+
+jobs:
+  download-and-split:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.output_repo }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: target_repo
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y yt-dlp zip
+
+      - name: Download video
+        id: download
+        run: |
+          # Create download directory
+          mkdir -p downloads
+          cd downloads
+          
+          # Download video
+          yt-dlp -f bestvideo+bestaudio \
+            --merge-output-format mp4 \
+            -o "video_%(title)s.%(ext)s" \
+            "${{ github.event.inputs.video_url }}"
+          
+          # Get downloaded filename
+          VIDEO_FILE=$(ls -1 *.mp4 2>/dev/null | head -n 1)
+          
+          if [ -z "$VIDEO_FILE" ]; then
+            echo "No video file downloaded!"
+            exit 1
+          fi
+          
+          echo "VIDEO_FILE=$VIDEO_FILE" >> $GITHUB_ENV
+          echo "Downloaded: $VIDEO_FILE"
+          
+          # Get file size
+          FILE_SIZE=$(stat -c%s "$VIDEO_FILE")
+          FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE/1024/1024" | bc)
+          echo "FILE_SIZE_MB=$FILE_SIZE_MB" >> $GITHUB_ENV
+          echo "FILE_SIZE_BYTES=$FILE_SIZE" >> $GITHUB_ENV
+
+      - name: Split large file
+        id: split
+        run: |
+          cd downloads
+          
+          CHUNK_SIZE_BYTES=$((${{ github.event.inputs.chunk_size_mb }} * 1024 * 1024))
+          
+          echo "File size: ${FILE_SIZE_MB}MB"
+          echo "Chunk size: ${{ github.event.inputs.chunk_size_mb }}MB"
+          
+          # Check if file needs splitting
+          if [ $FILE_SIZE_BYTES -gt $CHUNK_SIZE_BYTES ]; then
+            echo "File exceeds limit, splitting..."
+            
+            # Get base name without extension
+            BASENAME=$(basename "$VIDEO_FILE" .mp4)
+            echo "SPLIT_BASENAME=$BASENAME" >> $GITHUB_ENV
+            
+            # Method 1: Using zip with split
+            # This creates: .z01, .z02, ..., .zip
+            zip -s ${{ github.event.inputs.chunk_size_mb }}m \
+              "${BASENAME}.zip" \
+              "$VIDEO_FILE"
+            
+            # List split files
+            echo "Created split files:"
+            ls -lh "${BASENAME}".z* "${BASENAME}".zip 2>/dev/null
+            
+            # Count chunks
+            CHUNK_COUNT=$(ls -1 "${BASENAME}".z* "${BASENAME}".zip 2>/dev/null | wc -l)
+            echo "CHUNK_COUNT=$CHUNK_COUNT" >> $GITHUB_ENV
+            echo "NEEDS_SPLIT=true" >> $GITHUB_ENV
+            
+            # Remove original file to save space
+            rm "$VIDEO_FILE"
+            
+          else
+            echo "File size within limit, no splitting needed"
+            echo "NEEDS_SPLIT=false" >> $GITHUB_ENV
+          fi
+
+      - name: Create split info file
+        if: env.NEEDS_SPLIT == 'true'
+        run: |
+          cd downloads
+          
+          # Create README with reassembly instructions
+          cat > REASSEMBLE.md << EOF
+          # How to Reassemble This Video
+          
+          Original video: ${{ env.VIDEO_FILE }}
+          Original size: ${{ env.FILE_SIZE_MB }} MB
+          Split into: ${{ env.CHUNK_COUNT }} chunks (${CHUNK_SIZE_MB}MB each)
+          
+          ## Reassembly Instructions
+          
+          ### On Linux/Mac:
+          \`\`\`bash
+          # Download all parts to the same directory
+          # Then run:
+          cat ${{ env.SPLIT_BASENAME }}.z* ${{ env.SPLIT_BASENAME }}.zip > reassembled.zip
+          unzip reassembled.zip
+          \`\`\`
+          
+          ### On Windows (PowerShell):
+          \`\`\`powershell
+          # Download all parts to the same directory
+          # Then run:
+          copy /b ${{ env.SPLIT_BASENAME }}.z* + ${{ env.SPLIT_BASENAME }}.zip reassembled.zip
+          # Then extract reassembled.zip
+          \`\`\`
+          
+          ### Using 7-Zip:
+          Simply open the .zip file with 7-Zip - it will automatically load all parts.
+          EOF
+          
+          echo "Created reassembly instructions"
+
+      - name: Move files to target repository
+        run: |
+          # Create videos directory in target repo
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          mkdir -p target_repo/videos/$TIMESTAMP
+          
+          # Move all files
+          if [ "$NEEDS_SPLIT" = "true" ]; then
+            mv downloads/${{ env.SPLIT_BASENAME }}.z* target_repo/videos/$TIMESTAMP/ 2>/dev/null || true
+            mv downloads/${{ env.SPLIT_BASENAME }}.zip target_repo/videos/$TIMESTAMP/ 2>/dev/null || true
+            mv downloads/REASSEMBLE.md target_repo/videos/$TIMESTAMP/
+          else
+            mv downloads/*.mp4 target_repo/videos/$TIMESTAMP/
+          fi
+          
+          # Create or update index file
+          cat >> target_repo/videos/INDEX.md << EOF
+          
+          ## Video $TIMESTAMP
+          - **Source:** ${{ github.event.inputs.video_url }}
+          - **Date:** $(date)
+          - **Size:** ${{ env.FILE_SIZE_MB }} MB
+          - **Split:** ${{ env.NEEDS_SPLIT }}
+          - **Location:** \`videos/$TIMESTAMP/\`
+          EOF
+
+      - name: Commit and push to repository
+        run: |
+          cd target_repo
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Check if there are changes
+          if [ -n "$(git status --porcelain)" ]; then
+            git add videos/
+            git commit -m "Add video from ${{ github.event.inputs.video_url }}
+            
+            File size: ${{ env.FILE_SIZE_MB }} MB
+            Split: ${{ env.NEEDS_SPLIT }}
+            Chunk size: ${{ github.event.inputs.chunk_size_mb }}MB"
+            
+            git push origin main
+            echo "Successfully pushed to repository"
+          else
+            echo "No changes to commit"
+          fi
+
+      - name: Upload artifacts (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloaded-video
+          path: downloads/
+          retention-days: 7
